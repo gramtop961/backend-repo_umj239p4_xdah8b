@@ -1,71 +1,104 @@
+from __future__ import annotations
+
+import asyncio
 import os
-from fastapi import FastAPI
+import random
+from datetime import datetime
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+app = FastAPI(title="PL Live API", version="1.0.0")
 
+# Allow frontend origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Dev: open CORS for sandbox
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 @app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+async def root():
+    return {"status": "ok", "service": "pl-live"}
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
 
-@app.get("/test")
-def test_database():
-    """Test endpoint to check if database is available and accessible"""
-    response = {
-        "backend": "✅ Running",
-        "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
-        "connection_status": "Not Connected",
-        "collections": []
+# Simple mock fixtures (ids match the frontend for demo)
+FIXTURE_IDS = ["pl-001", "pl-002", "pl-003"]
+FIXTURE_META = {
+    "pl-001": {"home": "Manchester City", "away": "Liverpool"},
+    "pl-002": {"home": "Arsenal", "away": "Tottenham"},
+    "pl-003": {"home": "Chelsea", "away": "Manchester United"},
+}
+
+
+@app.get("/fixtures")
+async def fixtures():
+    now = datetime.utcnow().isoformat()
+    return [
+        {
+            "id": fid,
+            "home": FIXTURE_META[fid]["home"],
+            "away": FIXTURE_META[fid]["away"],
+            "kickoff": now,
+            "venue": "TBD",
+        }
+        for fid in FIXTURE_IDS
+    ]
+
+
+def _initial_state(fid: str) -> dict:
+    return {
+        "id": fid,
+        "status": "LIVE",
+        "minute": random.randint(1, 5),
+        "scoreHome": 0,
+        "scoreAway": 0,
+        "xgHome": round(random.uniform(0.2, 0.6), 2),
+        "xgAway": round(random.uniform(0.1, 0.5), 2),
+        "shotsHome": random.randint(1, 4),
+        "shotsAway": random.randint(0, 3),
+        "possessionHome": random.randint(40, 60),
+        "home": FIXTURE_META[fid]["home"],
+        "away": FIXTURE_META[fid]["away"],
     }
-    
+
+
+@app.websocket("/ws/live")
+async def ws_live(websocket: WebSocket):
+    await websocket.accept()
+
+    # Per-connection state for all fixtures
+    state = {fid: _initial_state(fid) for fid in FIXTURE_IDS}
     try:
-        # Try to import database module
-        from database import db
-        
-        if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
-    except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
-    return response
+        while True:
+            # Update each fixture a bit and send individual messages
+            for fid in FIXTURE_IDS:
+                s = state[fid]
+                # Advance clock
+                s["minute"] = min(95, s["minute"] + random.randint(1, 2))
+                # Random chance of a goal
+                if random.random() < 0.12:
+                    if random.random() < 0.5:
+                        s["scoreHome"] += 1
+                        s["xgHome"] = round(s["xgHome"] + random.uniform(0.05, 0.2), 2)
+                        s["shotsHome"] += random.randint(1, 2)
+                    else:
+                        s["scoreAway"] += 1
+                        s["xgAway"] = round(s["xgAway"] + random.uniform(0.05, 0.2), 2)
+                        s["shotsAway"] += random.randint(1, 2)
+                # Small metric drift
+                s["xgHome"] = round(s["xgHome"] + random.uniform(0.0, 0.05), 2)
+                s["xgAway"] = round(s["xgAway"] + random.uniform(0.0, 0.05), 2)
+                s["shotsHome"] += random.choice([0, 0, 1])
+                s["shotsAway"] += random.choice([0, 0, 1])
+                s["possessionHome"] = max(35, min(65, s["possessionHome"] + random.choice([-1, 0, 1])))
 
+                await websocket.send_json(s)
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        # Client disconnected; simply exit
+        return
